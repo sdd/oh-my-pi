@@ -12,7 +12,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type {
 	BusChannel,
 	CollabUiRequest,
@@ -21,7 +21,19 @@ import type {
 	AgentEvent as WireAgentEvent,
 	SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
-import type { InteractiveModeContext } from "../modes/types";
+import type { CollabHostContext } from "../modes/types";
+import { REMOTE_PROTOCOL_VERSION } from "@oh-my-pi/pi-wire/remote";
+import { RemoteHistory } from "../remote/history";
+import { encodeHistoryDelta, historyPageHash } from "../remote/history-delta";
+import { RemoteCapture } from "../remote/capture";
+import { getConfigRootDir } from "@oh-my-pi/pi-utils/dirs";
+import * as path from "node:path";
+import type {
+	RemoteCaptureControl,
+	RemotePrompt,
+	RemotePromptStatus,
+	RemoteHistoryPage,
+} from "@oh-my-pi/pi-wire/remote";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
@@ -67,7 +79,13 @@ import {
 	serializeReplicatedEvent,
 } from "./replication-shrink";
 
+/** SHA-256 of the original guest prompt; retries compare the original submission. */
+function remotePromptDigest(text: string): string {
+	return new Bun.CryptoHasher("sha256").update(text).digest("hex");
+}
+
 /** Events that change the footer state guests render. */
+
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
 	agent_start: true,
 	agent_pause: true,
@@ -128,6 +146,8 @@ function isWireSessionEntry(entry: StoredSessionEntry): entry is StoredSessionEn
 const CONNECT_TIMEOUT_MS = 15_000;
 /** Max bytes served per fetch-transcript reply (guest re-requests from `newSize`). */
 export const TRANSCRIPT_READ_CAP = 4 * 1024 * 1024;
+/** Paged guests accumulate history in a bounded cache; their transcript reads stay smaller. */
+export const PAGED_TRANSCRIPT_READ_CAP = 512 * 1024;
 const TRANSCRIPT_ENTRY_TOO_LARGE_ERROR = `transcript entry exceeds transcript fetch cap (${TRANSCRIPT_READ_CAP} bytes)`;
 /**
  * Soft byte cap per `snapshot-chunk` frame. The first MB of a snapshot takes
@@ -208,7 +228,7 @@ export class CollabRelayUnavailableError extends Error {
 }
 
 export class CollabHost {
-	#ctx: InteractiveModeContext;
+	#ctx: CollabHostContext;
 	#socket: CollabSocket | null = null;
 	#link = "";
 	#webLink = "";
@@ -239,7 +259,15 @@ export class CollabHost {
 	 * yet, and after a shed, when the peer leaves the participant list but is
 	 * still owed a resync error.
 	 */
-	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#peers = new Map<number, { name: string; canWrite: boolean; pagedHistory: boolean }>();
+	#history: RemoteHistory | undefined;
+	#lastHistoryPage = new Map<number, RemoteHistoryPage>();
+	#remoteStreamVersion = 0;
+	#remoteStream: Extract<AgentSessionEvent, { type: "message_update" }>["message"] | undefined;
+	#historyTimer: Timer | undefined;
+	#capture: RemoteCapture | undefined;
+	#captureStarting: { id: string; promise: Promise<RemoteCapture> } | undefined;
+	#remotePrompts = new Map<string, { text: string; status: RemotePromptStatus["status"] }>();
 	/**
 	 * Never reset, including across a room recreation: ids must not be reissued, or
 	 * a late `ui-response` carrying an old id would settle an unrelated new request.
@@ -263,8 +291,22 @@ export class CollabHost {
 	#stopped = false;
 	/** Bumped on every `message_start`; keys a streaming message's superseding updates. */
 	#messageSeq = 0;
+	/**
+	 * Paged-notification epoch: bumped on room recreation and structural
+	 * transcript changes (compaction, branch summary). Guests treat an epoch
+	 * change as a resync boundary; within an epoch, a skipped or regressed
+	 * notification sequence means lost or stale notifications.
+	 */
+	#historyEpoch = 1;
+	/** Monotonic within #historyEpoch; advances on every paged history notification. */
+	#historySeq = 0;
 
-	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
+	#bumpHistoryEpoch(): void {
+		this.#historyEpoch++;
+		this.#historySeq = 0;
+	}
+
+	constructor(ctx: CollabHostContext, options: CollabHostOptions = {}) {
 		this.#ctx = ctx;
 		this.#instanceId = options.instanceId ?? randomBytes(8).toString("hex");
 		this.#generation = options.generation ?? 1;
@@ -480,6 +522,7 @@ export class CollabHost {
 
 		let opened = false;
 		socket.onOpen = () => {
+			this.#capture?.record("connected");
 			this.#relayConnected = true;
 			if (!opened) {
 				opened = true;
@@ -488,11 +531,14 @@ export class CollabHost {
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onPeerOverload = peer => this.#handlePeerOverload(peer);
+		socket.onTraffic = (sent, bytes, bufferedBytes) =>
+			this.#capture?.record("transport", { sent, bytes, bufferedBytes });
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
 		};
 		socket.onClose = (reason, willReconnect) => {
+			this.#capture?.record("disconnected", { retry: willReconnect });
 			this.#relayConnected = false;
 			if (this.#stopping || this.#stopped) return;
 			if (!opened) {
@@ -558,7 +604,10 @@ export class CollabHost {
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
 		this.#ctx.sessionManager.onEntryAppended = entry => {
-			if (isWireSessionEntry(entry) && this.#broadcastAllowed()) {
+			// Compaction and branch summaries structurally rewrite the transcript:
+			// paged cursors and notification sequences reset at that boundary.
+			if (entry.type === "compaction" || entry.type === "branch_summary") this.#bumpHistoryEpoch();
+			if (isWireSessionEntry(entry) && this.#broadcastAllowed() && this.#hasReplicaPeers()) {
 				const bounded = serializeReplicatedEntry(entry);
 				const shrunk = bounded.value;
 				if (shrunk.type === "custom_message" && shrunk.customType === COLLAB_ENTRY_OMITTED_CUSTOM_TYPE) {
@@ -568,8 +617,9 @@ export class CollabHost {
 					// (PR #11999 review). Notices never enter agent state.
 					this.#send({ t: "event", event: oversizedEntryNotice(entry.type) });
 				}
-				this.#socket?.send(encodeEntryFrame(bounded.json));
+				this.#sendReplicaFrame(encodeEntryFrame(bounded.json));
 			}
+			this.#notifyHistory();
 			// Model/thinking/title changes land as entries while idle; refresh
 			// guest state promptly (debounce + JSON diff dedupe).
 			this.#scheduleStateBroadcast();
@@ -647,6 +697,8 @@ export class CollabHost {
 	async #runTeardown(): Promise<void> {
 		if (this.#stopped) return;
 		this.#stopped = true;
+		clearTimeout(this.#historyTimer);
+		void this.#capture?.stop();
 		// A room that ended on its own (fatal relay close) reaches here without
 		// `#runStop`: leave the public slot before the first await as well.
 		if (this.#ctx.collabHost === this) this.#ctx.collabHost = undefined;
@@ -679,6 +731,8 @@ export class CollabHost {
 		for (const pending of this.#pendingUi.values()) pending.settle({ kind: "unavailable" });
 		this.#pendingUi.clear();
 		this.#peers.clear();
+		this.#lastHistoryPage.clear();
+		this.#history = undefined;
 		this.#socket?.close();
 		this.#socket = null;
 		this.#ctx.statusLine.setCollabStatus(null);
@@ -765,6 +819,10 @@ export class CollabHost {
 		// current-session data. Do not strand guests if it settles during a
 		// provisional /resume that later rolls back. All other traffic stays gated.
 		if (this.#sendSuppressed(frame)) return;
+		this.#capture?.record("response", {
+			bytes: Buffer.byteLength(JSON.stringify(frame)),
+			...("reqId" in frame ? { reqId: frame.reqId } : {}),
+		});
 		this.#socket?.send(frame, toPeer);
 	}
 
@@ -796,15 +854,215 @@ export class CollabHost {
 	/** Broadcast one session event, bounded and serialized exactly once. */
 	#broadcastEvent(event: AgentSessionEvent): void {
 		if (event.type === "message_start") this.#messageSeq++;
-		if (!this.#broadcastAllowed()) return;
+		if ((event.type === "message_start" || event.type === "message_update") && event.message.role === "assistant") {
+			this.#remoteStream = event.message;
+			this.#remoteStreamVersion++;
+			this.#notifyHistory();
+		} else if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#remoteStream = undefined;
+			this.#remoteStreamVersion++;
+			this.#notifyHistory();
+		}
+		if (!this.#broadcastAllowed() || !this.#hasReplicaPeers()) return;
 		const frame = encodeEventFrame(serializeReplicatedEvent(event).json);
 		// Each update carries the whole message so far, so a newer one supersedes
 		// any still queued for the same message (#16956). Keyed per message so the
 		// last update of one message is never superseded by the next one's.
 		const socket = this.#socket;
+		if ([...this.#peers.values()].some(peer => peer.pagedHistory)) {
+			for (const [peerId, peer] of this.#peers) {
+				if (peer.pagedHistory) continue;
+				if (event.type === "message_update")
+					socket?.sendLatest(`message_update:${this.#messageSeq}`, frame, peerId);
+				else socket?.send(frame, peerId);
+			}
+			return;
+		}
 		if (event.type === "notice") socket?.broadcastAdvisory(frame);
 		else if (event.type === "message_update") socket?.sendLatest(`message_update:${this.#messageSeq}`, frame);
 		else socket?.send(frame);
+	}
+
+	#hasReplicaPeers(): boolean {
+		return [...this.#peers.values()].some(peer => !peer.pagedHistory);
+	}
+
+	#sendReplicaFrame(frame: EncodedFrame): void {
+		if (![...this.#peers.values()].some(peer => peer.pagedHistory)) {
+			this.#socket?.send(frame);
+			return;
+		}
+		for (const [peerId, peer] of this.#peers) if (!peer.pagedHistory) this.#socket?.send(frame, peerId);
+	}
+
+	#historyRevision(): string {
+		const base = this.#ctx.sessionManager.getReplicationRevision();
+		return this.#remoteStreamVersion ? `${base}:live${this.#remoteStreamVersion}` : base;
+	}
+
+	#getHistory(): RemoteHistory {
+		const revision = this.#historyRevision();
+		if (this.#history?.revision !== revision) {
+			const entries = this.#ctx.sessionManager.getBranch();
+			const live = this.#remoteStream ?? this.#ctx.session.state?.streamMessage;
+			if (live?.role === "assistant")
+				entries.push({
+					type: "message",
+					id: `live-${this.#messageSeq}`,
+					parentId: entries.at(-1)?.id ?? null,
+					timestamp: new Date(live.timestamp).toISOString(),
+					message: live,
+				});
+			this.#history = new RemoteHistory(this.#sessionId, revision, entries);
+		}
+		return this.#history;
+	}
+
+	#notifyHistory(): void {
+		if (this.#historyTimer || ![...this.#peers.values()].some(peer => peer.pagedHistory)) return;
+		this.#historyTimer = setTimeout(() => {
+			this.#historyTimer = undefined;
+			if (!this.#guestTrafficAllowed()) return;
+			const revision = this.#historyRevision();
+			const seq = ++this.#historySeq;
+			for (const [peerId, peer] of this.#peers)
+				if (peer.pagedHistory)
+					this.#send(
+						{ t: "history-changed", sessionId: this.#sessionId, revision, epoch: this.#historyEpoch, seq },
+						peerId,
+					);
+		}, 200);
+	}
+
+	#handleRemotePrompt(frame: RemotePrompt, peerId: number): void {
+		const reject = (): void => {
+			this.#send({ t: "prompt-status", id: frame.id, status: "rejected" }, peerId);
+		};
+		if (
+			!this.#peers.get(peerId)?.canWrite ||
+			frame.sessionId !== this.#sessionId ||
+			typeof frame.id !== "string" ||
+			!/^[a-f0-9-]{36}$/i.test(frame.id) ||
+			typeof frame.text !== "string" ||
+			Buffer.byteLength(frame.text) > 64 * 1024 ||
+			!this.#guestActionsReady()
+		) {
+			reject();
+			return;
+		}
+		const previous = this.#remotePrompts.get(frame.id);
+		if (previous) {
+			this.#send(
+				{ t: "prompt-status", id: frame.id, status: previous.text === frame.text ? previous.status : "rejected" },
+				peerId,
+			);
+			return;
+		}
+		const persisted = this.#ctx.sessionManager
+			.snapshotForReplication()
+			.entries.find(
+				entry =>
+					entry.type === "custom_message" && isRecord(entry.details) && entry.details.remoteRequestId === frame.id,
+			);
+		if (persisted?.type === "custom_message") {
+			// Extensions may rewrite the submitted content before it is persisted:
+			// retries compare the ORIGINAL prompt digest, falling back to content
+			// equality only for records persisted before digests existed.
+			const digest =
+				isRecord(persisted.details) && typeof persisted.details.remotePromptDigest === "string"
+					? persisted.details.remotePromptDigest
+					: undefined;
+			const matches = digest ? digest === remotePromptDigest(frame.text) : persisted.content === frame.text;
+			this.#send({ t: "prompt-status", id: frame.id, status: matches ? "accepted" : "rejected" }, peerId);
+			return;
+		}
+		if (this.#remotePrompts.size >= 128) {
+			const settled = [...this.#remotePrompts].find(([, request]) => request.status !== "pending");
+			if (!settled) {
+				reject();
+				return;
+			}
+			this.#remotePrompts.delete(settled[0]);
+		}
+		this.#remotePrompts.set(frame.id, { text: frame.text, status: "pending" });
+		this.#send({ t: "prompt-status", id: frame.id, status: "pending" }, peerId);
+		this.#handlePrompt(frame.text, undefined, peerId, frame.id);
+	}
+
+	#finishRemotePrompt(id: string, status: RemotePromptStatus["status"], peerId: number): void {
+		const request = this.#remotePrompts.get(id);
+		if (request) request.status = status;
+		this.#send({ t: "prompt-status", id, status }, peerId);
+	}
+
+	async #controlCapture(frame: RemoteCaptureControl, peerId: number): Promise<void> {
+		if (!this.#peers.get(peerId)?.canWrite) {
+			this.#rejectReadOnly("capture control", peerId);
+			return;
+		}
+		try {
+			if (!/^[a-f0-9-]{36}$/i.test(frame.id)) throw new Error("Invalid capture ID");
+			// Stale-operation rejection: a control carrying an epoch from before a
+			// structural or transport boundary refers to a capture that no longer
+			// exists on this host. Retries for a capture the host still holds stay
+			// idempotent; anything else is refused instead of silently re-created.
+			if (
+				frame.epoch !== undefined &&
+				frame.epoch !== this.#historyEpoch &&
+				this.#capture?.id !== frame.id &&
+				this.#captureStarting?.id !== frame.id
+			)
+				throw new Error(`Stale capture control: epoch ${frame.epoch} no longer current`);
+			if (this.#captureStarting) {
+				if (this.#captureStarting.id !== frame.id) throw new Error("A capture is already starting");
+				await this.#captureStarting.promise;
+			}
+			if (frame.action === "start") {
+				if (this.#capture && !this.#capture.status.closed && this.#capture.id !== frame.id)
+					throw new Error("A capture is already active");
+				if (!this.#capture || this.#capture.id !== frame.id) {
+					const promise = RemoteCapture.start({
+						id: frame.id,
+						role: "server",
+						directory: path.join(getConfigRootDir(), "remote", "captures"),
+					}).then(async capture => {
+						if (!this.#guestTrafficAllowed() || !this.#peers.get(peerId)?.canWrite) {
+							await capture.stop();
+							throw new Error("Capture starter is no longer authorized");
+						}
+						this.#capture = capture;
+						return capture;
+					});
+					this.#captureStarting = { id: frame.id, promise };
+					try {
+						await promise;
+					} finally {
+						this.#captureStarting = undefined;
+					}
+				}
+			} else if (this.#capture?.id !== frame.id) throw new Error("Capture not found");
+			else if (frame.action === "stop") await this.#capture.stop();
+			else if (frame.action === "mark")
+				this.#capture.record("mark", undefined, typeof frame.mark === "string" ? frame.mark : undefined);
+			else throw new Error("Invalid capture action");
+			const status = this.#capture!.status;
+			this.#send(
+				{
+					t: "capture-status",
+					id: frame.id,
+					active: !status.closed,
+					bytes: status.bytes,
+					dropped: status.dropped,
+					error: status.error,
+				},
+				peerId,
+			);
+		} catch (error) {
+			this.#send(
+				{ t: "capture-status", id: frame.id, active: false, bytes: 0, dropped: 0, error: String(error) },
+				peerId,
+			);
+		}
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {
@@ -832,10 +1090,51 @@ export class CollabHost {
 		// aborts, agent control); none may reach a session this room never
 		// shared, or one whose room is already ending.
 		if (!this.#guestTrafficAllowed()) return;
+		this.#capture?.record("request", {
+			bytes: Buffer.byteLength(JSON.stringify(frame)),
+			...("reqId" in frame ? { reqId: frame.reqId } : {}),
+		});
 		switch (frame.t) {
-			case "hello":
-				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
+			case "remote-prompt":
+				this.#handleRemotePrompt(frame, fromPeer);
 				break;
+			case "capture-control":
+				void this.#controlCapture(frame, fromPeer);
+				break;
+			case "hello":
+				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer, frame.pagedHistory === true);
+				break;
+			case "history-fetch": {
+				if (!this.#peers.get(fromPeer)?.pagedHistory) break;
+				try {
+					if (frame.direction !== "before" && frame.direction !== "after")
+						throw new Error("Invalid history direction");
+					const history = this.#getHistory();
+					if (frame.revision !== undefined && frame.revision !== history.revision) {
+						this.#send(
+							{
+								t: "history-changed",
+								reqId: frame.reqId,
+								sessionId: this.#sessionId,
+								revision: history.revision,
+							},
+							fromPeer,
+						);
+					} else {
+						const page = history.page(frame.reqId, frame.direction, frame.cursor);
+						const base = this.#lastHistoryPage.get(fromPeer);
+						const response =
+							base && !frame.cursor && frame.have === historyPageHash(base)
+								? encodeHistoryDelta(base, page)
+								: page;
+						this.#lastHistoryPage.set(fromPeer, page);
+						this.#send(response, fromPeer);
+					}
+				} catch (error) {
+					this.#send({ t: "error", message: `History request failed: ${String(error)}` }, fromPeer);
+				}
+				break;
+			}
 			case "prompt":
 				if (this.#rejectWhileStarting("prompting", fromPeer)) break;
 				this.#handlePrompt(frame.text, frame.images, fromPeer);
@@ -883,7 +1182,13 @@ export class CollabHost {
 		return true;
 	}
 
-	#handleHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): void {
+	#handleHello(
+		name: string,
+		proto: number,
+		writeToken: string | undefined,
+		fromPeer: number,
+		pagedHistory = false,
+	): void {
 		if (this.#ctx.session.isSessionTransitioning) {
 			this.#send({ t: "error", message: "Session transition in progress; join again when it completes" }, fromPeer);
 			return;
@@ -899,7 +1204,7 @@ export class CollabHost {
 		const canWrite = this.#verifyWriteToken(writeToken);
 		const firstPeer = this.#peers.size === 0;
 		const registered = this.#peers.get(fromPeer);
-		this.#peers.set(fromPeer, { name: cleanName, canWrite });
+		this.#peers.set(fromPeer, { name: cleanName, canWrite, pagedHistory });
 
 		const socket = this.#socket;
 		if (!socket) return;
@@ -909,7 +1214,10 @@ export class CollabHost {
 		// copy. Chunk frames are assembled from these strings only as the
 		// transport drains.
 		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
-		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
+		const history = pagedHistory ? { sessionId: this.#sessionId, revision: this.#historyRevision() } : undefined;
+		const snapshotEntries = pagedHistory
+			? { json: [], bytes: [] }
+			: this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
 		const state = this.#buildState();
 		const welcome = encodeFrame({
 			t: "welcome",
@@ -918,6 +1226,9 @@ export class CollabHost {
 			state,
 			agents: this.#snapshotAgents(),
 			entryCount: snapshotEntries.json.length,
+			history: history
+				? { version: REMOTE_PROTOCOL_VERSION, sessionId: history.sessionId, revision: history.revision }
+				: undefined,
 			readOnly: canWrite ? undefined : true,
 		});
 		// Welcome, chunks and replayed asks are one queue entry: up to
@@ -1128,7 +1439,7 @@ export class CollabHost {
 		}
 	}
 
-	#handlePrompt(text: string, images: ImageContent[] | undefined, fromPeer: number): void {
+	#handlePrompt(text: string, images: ImageContent[] | undefined, fromPeer: number, remoteRequestId?: string): void {
 		const peer = this.#peers.get(fromPeer);
 		if (!peer?.canWrite) {
 			this.#rejectReadOnly("prompting", fromPeer);
@@ -1137,7 +1448,10 @@ export class CollabHost {
 		const name = peer.name;
 		const content: string | (TextContent | ImageContent)[] =
 			images && images.length > 0 ? [{ type: "text", text }, ...images] : text;
-		const details: CollabPromptDetails = { from: name };
+		const details: CollabPromptDetails = {
+			from: name,
+			...(remoteRequestId ? { remoteRequestId, remotePromptDigest: remotePromptDigest(text) } : {}),
+		};
 		if (this.#ctx.session.isStreaming) {
 			this.#ctx.updatePendingMessagesDisplay();
 			this.#ctx.ui.requestRender();
@@ -1155,9 +1469,12 @@ export class CollabHost {
 				{ streamingBehavior: "steer", queueChipText: text },
 			)
 			.then(dispatched => {
+				if (remoteRequestId)
+					this.#finishRemotePrompt(remoteRequestId, dispatched === false ? "rejected" : "accepted", fromPeer);
 				if (dispatched === false) return this.#notifyPromptDropped(fromPeer);
 			})
 			.catch(err => {
+				if (remoteRequestId) this.#finishRemotePrompt(remoteRequestId, "rejected", fromPeer);
 				logger.warn("collab guest prompt failed", { error: String(err) });
 				this.#send({ t: "error", message: `prompt failed: ${String(err)}` }, fromPeer);
 			});
@@ -1209,10 +1526,15 @@ export class CollabHost {
 	#handleRoomRecreated(): void {
 		if (this.#stopped) return;
 		this.#unnotified.clear();
+		// A recreated room means a transport-level restart: paged guests that
+		// auto-rejoin must resync rather than trust sequence continuity.
+		this.#bumpHistoryEpoch();
 		if (this.#peers.size === 0 && this.#pendingUi.size === 0) return;
 		// Identities first: settle() fans `ui-request-end` out over #peers, and those
 		// ids belong to the room that just went away.
 		this.#peers.clear();
+		this.#lastHistoryPage.clear();
+		this.#history = undefined;
 		// A mirrored local dialog remains open through a transport reconnect. Keep
 		// its request for replay after a new hello verifies the writer again. Bare
 		// guest-only callers still settle rather than wait without a recipient.
@@ -1228,6 +1550,7 @@ export class CollabHost {
 
 	/** Identity and UI only: the socket already retired the peer and dropped its backlog. */
 	#handlePeerLeft(peer: number): void {
+		this.#lastHistoryPage.delete(peer);
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#dropAskRecipient(peer);
@@ -1240,6 +1563,7 @@ export class CollabHost {
 
 	/** The socket discarded this peer's backlog to keep the room alive; drop it and tell it to rejoin. */
 	#handlePeerOverload(peer: number): void {
+		this.#lastHistoryPage.delete(peer);
 		if (this.#stopped) return;
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
@@ -1418,7 +1742,8 @@ export class CollabHost {
 				reply("", stat.size);
 				return;
 			}
-			const want = Math.min(stat.size - fromByte, TRANSCRIPT_READ_CAP);
+			const cap = this.#peers.get(fromPeer)?.pagedHistory ? PAGED_TRANSCRIPT_READ_CAP : TRANSCRIPT_READ_CAP;
+			const want = Math.min(stat.size - fromByte, cap);
 			const handle = await fs.open(file, "r");
 			let bytesRead: number;
 			const buf = Buffer.allocUnsafe(want);

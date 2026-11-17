@@ -174,7 +174,27 @@ export interface AgentHubOpenOptions {
 	initialSection?: "agents" | "activity";
 }
 
-export interface InteractiveModeContext {
+/**
+ * The slice of interactive context a {@link CollabHost} actually depends on.
+ * Narrow on purpose: persistent headless hosts construct this directly instead
+ * of faking an interactive context.
+ */
+export interface CollabHostContext {
+	session: AgentSession;
+	sessionManager: SessionManager;
+	settings: Settings;
+	ui: Pick<TUI, "requestRender">;
+	statusLine: Pick<StatusLineComponent, "setCollabStatus" | "invalidate" | "getCachedContextBreakdown">;
+	showStatus(message: string, options?: ShowStatusOptions): void;
+	updatePendingMessagesDisplay(): void;
+	eventBus?: EventBus;
+	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
+	subagentEventBus?: EventBus;
+	/** Owned room; the host registers and clears itself here. */
+	collabHost?: CollabHost;
+}
+
+export interface InteractiveModeContext extends CollabHostContext {
 	// UI access
 	ui: TUI;
 	readonly composer: Pick<Composer, "setRunActive">;
@@ -296,8 +316,6 @@ export interface InteractiveModeContext {
 	lspServers?: LspStartupServerInfo[];
 	/** Owns hosting: manual `/collab`, `collab.autoStart`, and room rotation on session switch. */
 	collabController: CollabController;
-	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
-	collabHost?: CollabHost;
 	/** The collab session this process joined as a guest; set with {@link setCollabGuest}. */
 	readonly collabGuest?: CollabGuestLink;
 	/** Join (`guest`) or leave (`undefined`) a collab session as a guest. */

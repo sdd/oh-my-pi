@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added experimental `omp join --paged` with bounded transcript history, saved drafts, and local journey captures with optional macOS location and phone GPX correlation.
+- Added structural source anchoring and unified rendering for the paged guest: cached blocks stay anchored through resize, page insertion, and eviction, with bounded Markdown continuation, merged tool call/result cards, image placeholders, and Agent Hub/subagent controls.
+- Added `omp host --profile=<name> --session=<file|id>` for a persistent headless host that binds one explicit session, refuses silent rebinds, and keeps the binding across restarts.
+- Added host-side prompt deduplication by original-submission digest, session-scoped event epochs with gap detection and bounded resync, stale capture-control rejection, and guest endpoint persistence independent of invitation URLs.
+
 ## [18.21.0] - 2026-11-16
 
 ### Breaking Changes

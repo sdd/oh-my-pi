@@ -11,6 +11,10 @@
  * JSON boundary and every `switch` keeps a tolerant `default:` branch.
  */
 
+import type { RemoteCaptureControl, RemoteHistoryRequest, RemoteHostFrame, RemotePrompt } from "./remote";
+
+export * from "./remote";
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Content blocks
 // ═══════════════════════════════════════════════════════════════════════════
@@ -172,6 +176,9 @@ export const COLLAB_PROMPT_MESSAGE_TYPE = "collab-prompt";
 /** `details` shape of `custom_message` entries with `customType === "collab-prompt"`. */
 export interface CollabPromptDetails {
 	from?: string;
+	remoteRequestId?: string;
+	/** SHA-256 of the ORIGINAL guest submission; extensions may rewrite `content`, retries must compare this. */
+	remotePromptDigest?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -332,6 +339,8 @@ export type GuestFrame =
 			t: "hello";
 			proto: number;
 			name: string;
+			/** Opt in to bounded history instead of the legacy full snapshot. */
+			pagedHistory?: boolean;
 			/**
 			 * base64url write token proving full-link possession; absent for
 			 * read-only (view) links. The host marks peers without a valid token
@@ -343,7 +352,10 @@ export type GuestFrame =
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
 	| { t: "abort" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
-	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
+	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number }
+	| RemoteHistoryRequest
+	| RemoteCaptureControl
+	| RemotePrompt;
 
 /** EventBus channels mirrored to guests (task subagent traffic only). */
 export type BusChannel = "task:subagent:progress" | "task:subagent:lifecycle";
@@ -362,6 +374,8 @@ export type HostFrame =
 			 * with `final: true`).
 			 */
 			entryCount: number;
+			/** Present only when the guest explicitly requested paged history. */
+			history?: { version: number; sessionId: string; revision: string };
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
@@ -384,7 +398,8 @@ export type HostFrame =
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
-	| { t: "error"; message: string; resync?: true };
+	| { t: "error"; message: string; resync?: true }
+	| RemoteHostFrame;
 
 export type WireFrame = GuestFrame | HostFrame;
 

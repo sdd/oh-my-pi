@@ -26,6 +26,18 @@ function loadLaunchHelp(): typeof LaunchHelp.launchHelp {
 
 export const commands: CommandEntry[] = [
 	{
+		// Keep implementation imports behind the command boundary: this table is
+		// also imported before profile bootstrap and by native-free worker entries.
+		name: "capture-report",
+		load: () => import("./commands/capture-report").then(m => m.default),
+		help: { description: "Correlate local remote-agent captures and an optional phone GPX track" },
+	},
+	{
+		name: "host",
+		load: () => import("./commands/host").then(m => m.default),
+		help: { description: "Serve a bound session to remote paged guests (persistent host)" },
+	},
+	{
 		name: "launch",
 		load: () => import("./commands/launch").then(m => m.default),
 		get help() {

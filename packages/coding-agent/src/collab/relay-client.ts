@@ -113,6 +113,8 @@ export class CollabSocket {
 	onClose?: (reason: string, willReconnect: boolean) => void;
 	/** A targeted backlog was discarded to keep the room alive; the peer must resync. Always deferred to a microtask. */
 	onPeerOverload?: (peerId: number) => void;
+	/** WebSocket payload bytes, including sealed envelopes and relay controls; excludes framing and TCP/TLS overhead. */
+	onTraffic?: (sent: boolean, bytes: number, bufferedBytes: number) => void;
 
 	readonly #opts: CollabSocketOptions;
 	#ws: WebSocket | null = null;
@@ -233,10 +235,10 @@ export class CollabSocket {
 	 *
 	 * @returns whether the newest frame was admitted.
 	 */
-	sendLatest(key: string, frame: CollabFrame | EncodedFrame): boolean {
+	sendLatest(key: string, frame: CollabFrame | EncodedFrame, targetPeer = 0): boolean {
 		const head = this.#pendingSends[0];
-		this.#discardWhere(pending => pending !== head && pending.key === key);
-		return this.#sendOne(frame, 0, key);
+		this.#discardWhere(pending => pending !== head && pending.key === key && pending.targetPeer === targetPeer);
+		return this.#sendOne(frame, targetPeer, key);
 	}
 
 	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string, advisory = false): boolean {
@@ -569,6 +571,7 @@ export class CollabSocket {
 			if (pending.cancelled) return "cancelled";
 			if (ws !== this.#ws || !this.#isWritable(ws) || ws.bufferedAmount >= WS_BACKPRESSURE_THRESHOLD) continue;
 			ws.send(envelope);
+			this.onTraffic?.(true, envelope.byteLength, ws.bufferedAmount);
 			return "sent";
 		}
 		return "stop";
@@ -659,7 +662,10 @@ export class CollabSocket {
 				// prepared envelope (typically a final `bye`) enters the socket buffer
 				// ahead of the close frame.
 				if (ws.readyState === WebSocket.OPEN) {
-					for (const envelope of prepared) ws.send(envelope);
+					for (const envelope of prepared) {
+						ws.send(envelope);
+						this.onTraffic?.(true, envelope.byteLength, ws.bufferedAmount);
+					}
 				}
 				ws.close(1000);
 			} catch {
@@ -692,6 +698,8 @@ export class CollabSocket {
 		};
 		ws.onmessage = (event: MessageEvent) => {
 			if (this.#ws !== ws) return;
+			if (typeof event.data === "string") this.onTraffic?.(false, Buffer.byteLength(event.data), ws.bufferedAmount);
+			else if (event.data instanceof ArrayBuffer) this.onTraffic?.(false, event.data.byteLength, ws.bufferedAmount);
 			this.#lastHeard = Date.now();
 			// The relay only talks to a host it accepted; commit before dispatching so
 			// the room reset still precedes every frame.

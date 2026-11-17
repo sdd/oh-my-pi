@@ -14,6 +14,7 @@ import type {
 	GuestFrame,
 	ParsedCollabLink,
 	Participant,
+	RemoteHostFrame,
 	AgentSnapshot as WireAgentSnapshot,
 } from "@oh-my-pi/pi-wire";
 import {
@@ -75,6 +76,7 @@ export type CollabFrame =
 			 * (or a chunk arrives with `final: true`).
 			 */
 			entryCount: number;
+			history?: { version: number; sessionId: string; revision: string };
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
@@ -100,7 +102,8 @@ export type CollabFrame =
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
-	| { t: "error"; message: string; resync?: true };
+	| { t: "error"; message: string; resync?: true }
+	| RemoteHostFrame;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pre-serialized frames: the host bounds replicated payloads by serializing

@@ -1,0 +1,33 @@
+[package]
+name = "omp-remote-quic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+quinn = "0.11.11"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = "0.29"
+tungstenite = "0.29"
+rand = "0.9"
+
+[dev-dependencies]
+quinn = "0.11"
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = "0.29"

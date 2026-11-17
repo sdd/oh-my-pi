@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added structural source-map rendering and a bounded Markdown window renderer with continuation context, used by the paged remote guest to keep cached content anchored through resize, page insertion, and eviction.
+
 ## [18.21.0] - 2026-11-16
 
 ### Added

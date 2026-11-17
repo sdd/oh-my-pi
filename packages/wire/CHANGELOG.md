@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in paged transcript, acknowledged prompt, and journey capture messages for native remote guests.
+- Added event epoch/sequence fields to paged history notifications, an original-prompt digest to prompt details, and an epoch to capture-control messages for stale-operation rejection.
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

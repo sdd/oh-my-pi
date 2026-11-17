@@ -37,6 +37,8 @@ export function createAgentHubRuntime(
 		remote?: AgentHubRemote;
 		settings?: Settings;
 		sessionFile?: string | null;
+		/** Override persisted-roster discovery; a remote guest must not list local agents. */
+		loadPersisted?: (shouldContinue: () => boolean) => Promise<void>;
 	} = {},
 ): Pick<
 	AgentHubDeps<AgentRef>,
@@ -66,11 +68,13 @@ export function createAgentHubRuntime(
 		activity: options.activity ?? new AgentActivityIndex({ remote: options.remote }),
 		manageActivityLive: !options.activity,
 		transcript: agentTranscriptSource,
-		loadPersisted: shouldContinue =>
-			registerPersistedSubagents(registry, options.sessionFile, {
-				shouldContinue,
-				onCopiedRef: ref => copied.add(ref),
-			}),
+		loadPersisted:
+			options.loadPersisted ??
+			(shouldContinue =>
+				registerPersistedSubagents(registry, options.sessionFile, {
+					shouldContinue,
+					onCopiedRef: ref => copied.add(ref),
+				})),
 		getRoleInfo: options.settings ? role => getRoleInfo(role, options.settings!) : undefined,
 	};
 }

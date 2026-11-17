@@ -46,6 +46,7 @@ import {
 	type CollabUiRequest,
 	parseCollabLink,
 } from "./protocol";
+import { CollabAgentMirror } from "./agent-mirror";
 import { CollabSocket } from "./relay-client";
 
 /** Commands a guest may run locally; everything else is host-only. */
@@ -265,9 +266,11 @@ export class CollabGuestLink {
 	#lifecycleEmitter = new GuestLifecycleEmitter();
 	state: CollabSessionState | null = null;
 	/** Local mirror of the host's agent ecosystem (refs carry `session: null`). */
-	readonly agentRegistry = new AgentRegistry();
-	/** Per-agent `hasSessionFile` from the last snapshot; gates remote transcript fetches. */
-	#agentHasTranscript = new Map<string, boolean>();
+	readonly agentMirror = new CollabAgentMirror();
+	/** Backwards-compatible registry accessor for hub controllers. */
+	get agentRegistry() {
+		return this.agentMirror.registry;
+	}
 	#pendingTranscripts = new Map<number, (r: AgentHubRemoteTranscript | null) => void>();
 	/** Host `ui-request`s presented (or queued) locally, keyed by reqId; aborting dismisses. */
 	#pendingUiRequests = new Map<number, AbortController>();
@@ -287,7 +290,7 @@ export class CollabGuestLink {
 		},
 		readTranscript: (id, fromByte) => {
 			const socket = this.#socket;
-			if (!socket || this.#agentHasTranscript.get(id) === false) {
+			if (!socket || this.agentMirror.hasTranscript(id) === false) {
 				return Promise.resolve(null);
 			}
 			const reqId = this.#nextReqId++;
@@ -845,44 +848,11 @@ export class CollabGuestLink {
 
 	/** Diff a host agent snapshot into the local registry (refs keep `session: null`). */
 	#applyAgentSnapshots(agents: AgentSnapshot[]): void {
-		const seen = new Set<string>();
-		for (const snap of agents) seen.add(snap.id);
-		for (const ref of this.agentRegistry.list()) {
-			if (!seen.has(ref.id)) {
-				this.agentRegistry.unregister(ref.id);
-				this.#agentHasTranscript.delete(ref.id);
-			}
-		}
-		for (const snap of agents) {
-			if (this.agentRegistry.get(snap.id)) {
-				this.agentRegistry.setStatus(snap.id, snap.status);
-			} else {
-				this.agentRegistry.register({
-					id: snap.id,
-					displayName: snap.displayName,
-					kind: snap.kind,
-					parentId: snap.parentId,
-					session: null,
-					status: snap.status,
-				});
-			}
-			// Refs are returned by reference: patch host timestamps directly so
-			// hub age/activity columns reflect the host, not local registration.
-			const ref = this.agentRegistry.get(snap.id);
-			if (ref) {
-				ref.createdAt = snap.createdAt;
-				ref.lastActivity = snap.lastActivity;
-				ref.displayName = snap.displayName;
-			}
-			this.#agentHasTranscript.set(snap.id, snap.hasSessionFile);
-		}
+		this.agentMirror.apply(agents);
 	}
 
 	#clearAgentMirror(): void {
-		for (const ref of this.agentRegistry.list()) {
-			this.agentRegistry.unregister(ref.id);
-		}
-		this.#agentHasTranscript.clear();
+		this.agentMirror.clear();
 	}
 
 	/** Resolve every in-flight transcript request with null (resolvers clear their own timers). */

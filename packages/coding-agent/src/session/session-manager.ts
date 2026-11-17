@@ -3580,6 +3580,11 @@ export class SessionManager {
 		return { header: this.#header, entries: this.#entries };
 	}
 
+	/** Includes in-place rewrites and leaf navigation, not just appended entry count. */
+	getReplicationRevision(): string {
+		return `${this.#sessionId}:${this.#bodyRevision}:${this.#entries.length}:${this.#index.leafId() ?? ""}`;
+	}
+
 	/**
 	 * Append a message as a child of the current leaf, then advance the leaf.
 	 * CompactionSummaryMessage / BranchSummaryMessage are rejected here — they are

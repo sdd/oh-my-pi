@@ -1,4 +1,16 @@
 import { stripVTControlCharacters } from "node:util";
+import {
+	computeChildSpans,
+	computeTokenSpans,
+	denormalizeOffset,
+	normalizationOffsetMap,
+	proportionalRows,
+	sourceLineOffsets,
+	sourceRangeForWidth,
+	type SourceRow,
+	type TokenSpan,
+	type WidthSegment,
+} from "../render/source-map";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import {
 	Lexer,
@@ -47,6 +59,7 @@ import {
 	isOsc66Line,
 	padding,
 	replaceTabs,
+	stripTerminalSequences,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -1320,6 +1333,11 @@ function renderedLine(text: string, literalCode?: boolean): RenderedLine {
 	return literalCode ? { text, literalCode: true } : { text };
 }
 
+/** A renderer-generated spacing row: carries no visible content, so it anchors at its token's end. */
+function isBlankRenderedRow(text: string): boolean {
+	return stripTerminalSequences(text).trim().length === 0;
+}
+
 const renderCache = new LRUCache<string, readonly string[]>({
 	max: RENDER_CACHE_MAX,
 	maxSize: RENDER_CACHE_MAX_SIZE,
@@ -2554,6 +2572,8 @@ export class Markdown implements Component {
 	#renderingStablePrefix = false;
 	#streamingHighlightCache?: StreamingHighlightCache;
 	#activeRenderSignature?: RenderSignature;
+	/** Set during mapped renders; #renderList records per-item row structure into it. */
+	#listSpans?: { raw: string; itemRaws: string[]; counts: number[] }[];
 	#fastTail?: FastTailRecipe; // undefined = disarmed
 	// B+ capture plumbing: #renderContentLines records the last rendered paragraph row.
 	#lastTailCapture?: { kind: "paragraph"; open: boolean; rowInput: string; rowRaw: string };
@@ -3229,6 +3249,224 @@ export class Markdown implements Component {
 		this.#streamPrefixText = text.slice(0, frozen.end);
 		this.#streamPrefixTokens = tokens.slice(0, frozen.count);
 		this.#streamPrefixOpeners = openers;
+	}
+
+	/** Render with source spans for viewports that must survive reflow and insertion. */
+	renderMapped(width: number): SourceRow[] {
+		const paddingX = this.#ignoreTight ? this.#paddingX : getPaddingX(this.#paddingX);
+		const signature = this.#renderSignature(width, paddingX);
+		// Normalize exactly as render() does, so token raws and the offsets mapped
+		// back to the caller refer to the same text the rows were rendered from.
+		const tabbed = this.#text.includes("\t") ? replaceTabs(this.#text) : this.#text;
+		const normalizedText = this.transientRenderCache ? tabbed : repairOrphanClosingFence(tabbed);
+		const contentWidth = Math.max(1, width - paddingX * 2);
+		const tokens = this.#lexTokens(normalizedText);
+		const spans = computeTokenSpans(normalizedText, tokens);
+		const normalizeMap = normalizationOffsetMap(this.#text, normalizedText);
+		const result: SourceRow[] = [];
+		this.#activeRenderSignature = signature;
+		this.#listSpans = [];
+		try {
+			for (let i = 0; i < tokens.length; i++) {
+				const token = tokens[i];
+				const lines = this.#renderContentLines(tokens, i, i + 1, contentWidth, signature);
+				const mapped = this.#mapTokenOutputRows(token, lines, spans[i]!, contentWidth);
+				for (const row of mapped) {
+					result.push({
+						text: row.text,
+						start: denormalizeOffset(normalizeMap, row.start),
+						end: denormalizeOffset(normalizeMap, row.end),
+					});
+				}
+			}
+		} finally {
+			this.#activeRenderSignature = undefined;
+			this.#listSpans = undefined;
+		}
+		const empty = this.#renderEmptyPaddingLines(signature);
+		return [
+			...empty.map(text => ({ text, start: 0, end: 0 })),
+			...result,
+			...empty.map(text => ({ text, start: this.#text.length, end: this.#text.length })),
+		];
+	}
+
+	/**
+	 * Bind each rendered row of one token to its source range. Trailing blank
+	 * rows are renderer-generated spacing and anchor at the token's end; the
+	 * remaining rows are mapped by per-kind structure, falling back to a
+	 * monotone proportional distribution when structure and output disagree.
+	 */
+	#mapTokenOutputRows(token: Token, lines: readonly string[], span: TokenSpan, contentWidth: number): SourceRow[] {
+		const lineStarts = sourceLineOffsets(token.raw, span.start);
+		let contentCount = lines.length;
+		while (contentCount > 0 && isBlankRenderedRow(lines[contentCount - 1]!)) contentCount--;
+		const content = lines.slice(0, contentCount);
+		const rows: SourceRow[] = [];
+		for (let i = contentCount; i < lines.length; i++) rows.push({ text: lines[i]!, start: span.end, end: span.end });
+		if (content.length === 0) {
+			return rows.length > 0 ? rows : [{ text: "", start: span.end, end: span.end }];
+		}
+		rows.unshift(...this.#mapTokenContentRows(token, content, span, lineStarts, contentWidth));
+		return rows;
+	}
+
+	#mapTokenContentRows(
+		token: Token,
+		content: readonly string[],
+		span: TokenSpan,
+		lineStarts: readonly number[],
+		contentWidth: number,
+	): SourceRow[] {
+		const proportional = (): SourceRow[] => proportionalRows(content, span, lineStarts);
+		if (token.type === "code") {
+			// Mermaid diagrams are re-drawn as ASCII art: no line correspondence.
+			if (token.lang === "mermaid" && this.#theme.resolveMermaidAscii) return proportional();
+			const tokenText = typeof token.text === "string" ? token.text : "";
+			const bodyLines = tokenText.split("\n");
+			// The rendered block is [opening fence, ...body, closing fence?]. The
+			// closing fence is absent when the source fence was never closed.
+			const withClose = content.length === bodyLines.length + 2;
+			const withoutClose = content.length === bodyLines.length + 1;
+			if (withClose || withoutClose) {
+				const rows: SourceRow[] = [{ text: content[0]!, start: lineStarts[0]!, end: lineStarts[1] ?? span.end }];
+				for (let r = 0; r < bodyLines.length; r++) {
+					rows.push({
+						text: content[r + 1]!,
+						start: lineStarts[r + 1]!,
+						end: lineStarts[r + 2] ?? span.end,
+					});
+				}
+				if (withClose) {
+					rows.push({
+						text: content.at(-1)!,
+						start: lineStarts.at(-2)!,
+						end: lineStarts.at(-1)!,
+					});
+				}
+				return rows;
+			}
+			return proportional();
+		}
+		if (token.type === "paragraph") return this.#paragraphSourceRows(token, content, span, lineStarts, contentWidth);
+		if (token.type === "list") return this.#listSourceRows(token, content, span, lineStarts);
+		if (token.type === "table") {
+			// Box-drawn tables emit a top and bottom border row around one rendered
+			// row per source row: border rows anchor to the adjacent source row.
+			const lineCount = lineStarts.length - 1;
+			if (content.length === lineCount + 2) {
+				return content.map((text, r) => {
+					const line = Math.min(lineCount - 1, Math.max(0, r - 1));
+					return { text, start: lineStarts[line]!, end: lineStarts[line + 1] ?? span.end };
+				});
+			}
+		}
+		// Heading, blockquote, html, math, hr and unknown kinds: rows map
+		// line-for-line when counts line up, otherwise proportionally.
+		if (content.length === lineStarts.length - 1) {
+			return content.map((text, r) => ({ text, start: lineStarts[r]!, end: lineStarts[r + 1] ?? span.end }));
+		}
+		return proportional();
+	}
+
+	/**
+	 * Map paragraph rows through inline structure: each inline child is rendered
+	 * solo to learn its visible width and source range, the joined segments are
+	 * byte-verified against the paragraph's real rendering, and rows then claim
+	 * the source range their visible width covers. Falls back to the proportional
+	 * distribution whenever structure and rendering disagree.
+	 */
+	#paragraphSourceRows(
+		token: Token,
+		content: readonly string[],
+		span: TokenSpan,
+		lineStarts: readonly number[],
+		contentWidth: number,
+	): SourceRow[] {
+		const proportional = (): SourceRow[] => proportionalRows(content, span, lineStarts);
+		const children = "tokens" in token && Array.isArray(token.tokens) ? token.tokens : [];
+		if (children.length === 0 || soleDisplayMath(children)) return proportional();
+		const rawsTotal = children.reduce(
+			(sum, child) => sum + (typeof child.raw === "string" ? child.raw.length : 0),
+			0,
+		);
+		if (rawsTotal !== token.raw.length) return proportional();
+		const childSpans = computeChildSpans(token.raw, children, span.start);
+		const previousBlock = this.#extensionLinkBlock;
+		const previousOrdinal = this.#extensionLinkOrdinal;
+		this.#extensionLinkBlock = previousBlock;
+		this.#extensionLinkOrdinal = 0;
+		let verified = true;
+		const segments: WidthSegment[] = [];
+		const parts: string[] = [];
+		try {
+			for (let i = 0; i < children.length; i++) {
+				const child = children[i];
+				const text = this.#renderInlineTokens([child]);
+				parts.push(text);
+				segments.push({ start: childSpans[i]!.start, end: childSpans[i]!.end, width: visibleWidth(text) });
+			}
+			verified = parts.join("") === this.#renderInlineTokens(children);
+		} finally {
+			this.#extensionLinkOrdinal = previousOrdinal;
+		}
+		if (!verified) return proportional();
+		// Re-derive the wrapped rows from the verified segment concatenation; this
+		// mirrors the renderer's own paragraph wrapping, so counts line up 1:1.
+		const joined = parts.join("");
+		const logical = hangWrapTreeGuideLines(joined, contentWidth) ?? [joined];
+		const wrapped: string[] = [];
+		for (const logicalLine of logical) wrapped.push(...wrapTextWithAnsi(logicalLine, contentWidth));
+		if (wrapped.length !== content.length) return proportional();
+		const rows: SourceRow[] = [];
+		let cursor = 0;
+		for (const row of wrapped) {
+			const next = cursor + visibleWidth(row);
+			const range = sourceRangeForWidth(segments, cursor, next);
+			rows.push({ text: row, ...range });
+			cursor = next;
+		}
+		return rows;
+	}
+
+	/**
+	 * Map list rows to source using the per-item structure #renderList recorded
+	 * during the same render. Falls back to the proportional distribution when
+	 * the recorded structure does not line up with the output.
+	 */
+	#listSourceRows(
+		token: Token,
+		content: readonly string[],
+		span: TokenSpan,
+		lineStarts: readonly number[],
+	): SourceRow[] {
+		const proportional = (): SourceRow[] => proportionalRows(content, span, lineStarts);
+		const items = "items" in token && Array.isArray(token.items) ? token.items : undefined;
+		const recorded = this.#listSpans?.find(entry => entry.raw === token.raw);
+		if (!items || !recorded || recorded.itemRaws.length !== items.length) return proportional();
+		const totalRows = recorded.counts.reduce((sum, count) => sum + count, 0);
+		if (totalRows !== content.length) return proportional();
+		// Item raws must reassemble the token raw; otherwise anchors would drift.
+		if (recorded.itemRaws.reduce((sum, raw) => sum + raw.length, 0) !== token.raw.length) return proportional();
+		const rows: SourceRow[] = [];
+		let sourceCursor = span.start;
+		let rowIndex = 0;
+		for (let k = 0; k < recorded.itemRaws.length; k++) {
+			const itemRaw = recorded.itemRaws[k]!;
+			const itemEnd = sourceCursor + itemRaw.length;
+			const count = recorded.counts[k]!;
+			const itemRows = content.slice(rowIndex, rowIndex + count);
+			rows.push(
+				...proportionalRows(
+					itemRows,
+					{ start: sourceCursor, end: itemEnd },
+					sourceLineOffsets(itemRaw, sourceCursor),
+				),
+			);
+			rowIndex += count;
+			sourceCursor = itemEnd;
+		}
+		return rows;
 	}
 
 	render(width: number): readonly string[] {
@@ -4690,16 +4928,20 @@ export class Markdown implements Component {
 			}
 		};
 
+		const spanRaws: string[] | undefined = this.#listSpans ? [] : undefined;
+		const spanCounts: number[] | undefined = this.#listSpans ? [] : undefined;
 		for (let i = 0; i < token.items.length; i++) {
 			const item = token.items[i];
+			const rowStart = lines.length;
 			if (i < reusableCount && reusable !== undefined && raws !== undefined && rows !== undefined) {
 				const cached = reusable.rows[i]!;
 				for (const row of cached) lines.push(row);
 				raws.push(item.raw);
 				rows.push(cached);
+				spanRaws?.push(item.raw);
+				spanCounts?.push(lines.length - rowStart);
 				continue;
 			}
-			const rowStart = lines.length;
 			const marker = token.ordered ? `${startNumber + i}. ` : "- ";
 			// A task item's leading checkbox token draws nothing in #renderListItem;
 			// draw it after the marker so wrapped rows hang under the task text.
@@ -4746,10 +4988,15 @@ export class Markdown implements Component {
 			} else {
 				lines.push(renderedLine(firstPrefix));
 			}
+			spanRaws?.push(item.raw);
+			spanCounts?.push(lines.length - rowStart);
 			if (raws !== undefined && rows !== undefined) {
 				raws.push(item.raw);
 				rows.push(lines.slice(rowStart));
 			}
+		}
+		if (this.#listSpans && spanRaws && spanCounts) {
+			this.#listSpans.push({ raw: token.raw, itemRaws: spanRaws, counts: spanCounts });
 		}
 		if (signature !== undefined && themeEpoch !== undefined && raws !== undefined && rows !== undefined) {
 			this.#listItemRowsCache = {
