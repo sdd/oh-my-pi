@@ -248,6 +248,8 @@ export class CollabHost {
 	#pendingPublication: Promise<CollabHostPublication | null> | null = null;
 	/** Set by the first teardown (explicit stop or fatal relay close); every later stop() awaits it. */
 	#teardownDone: Promise<void> | null = null;
+	/** Resolves when the room ends for any reason; the host command awaits this instead of the boolean `stopped`. */
+	#whenStopped = Promise.withResolvers<void>();
 	/** Rejects the in-flight first-open wait when `stop()` overtakes `start()`. */
 	#abortStart: ((reason: Error) => void) | null = null;
 	#unsubscribe?: () => void;
@@ -340,6 +342,11 @@ export class CollabHost {
 
 	get stopped(): boolean {
 		return this.#stopped;
+	}
+
+	/** Promise that resolves when the room ends for any reason (explicit stop, fatal relay close, teardown). */
+	get whenStopped(): Promise<void> {
+		return this.#whenStopped.promise;
 	}
 
 	/**
@@ -697,6 +704,7 @@ export class CollabHost {
 	async #runTeardown(): Promise<void> {
 		if (this.#stopped) return;
 		this.#stopped = true;
+		this.#whenStopped.resolve();
 		clearTimeout(this.#historyTimer);
 		void this.#capture?.stop();
 		// A room that ended on its own (fatal relay close) reaches here without

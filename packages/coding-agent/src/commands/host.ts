@@ -141,7 +141,9 @@ export default class Host extends Command {
 		process.on("SIGINT", onSignal);
 		process.on("SIGTERM", onSignal);
 		try {
-			await Promise.race([shutdown.promise, host.stopped]);
+			// `host.stopped` is a boolean getter — awaiting it would race nothing;
+			// `whenStopped` is the promise that actually resolves when the room ends.
+			await Promise.race([shutdown.promise, host.whenStopped]);
 		} finally {
 			process.off("SIGINT", onSignal);
 			process.off("SIGTERM", onSignal);

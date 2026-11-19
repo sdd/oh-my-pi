@@ -506,7 +506,11 @@ export async function runPagedGuest(link: string, terminal?: Terminal): Promise<
 		}
 		if (!viewport.connected || readOnly) {
 			composer.editor.setText(text);
-			viewport.status = readOnly ? "Read-only session · draft retained" : "Offline · draft retained";
+			viewport.status = readOnly
+				? parsed.writeToken
+					? "Read-only session · draft retained"
+					: "Read-only session · this link is view-only · draft retained"
+				: "Offline · draft retained";
 		} else {
 			if (outbox.size >= 16 || Buffer.byteLength(text) > 64 * 1024 || !sessionId) {
 				composer.editor.setText(text);
