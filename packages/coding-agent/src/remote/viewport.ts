@@ -63,6 +63,12 @@ export class RemoteViewport implements Component {
 		this.#anchor = undefined;
 	}
 
+	/** The user's current source cursor, for resyncing the anchored window. */
+	anchorCursor(): RemoteCursor | undefined {
+		if (!this.#anchor) return undefined;
+		return { block: this.#anchor.id, offset: this.#anchor.offset };
+	}
+
 	scroll(delta: number): void {
 		this.#follow = false;
 		const before = this.#scroll.getScrollOffset();

@@ -365,15 +365,24 @@ export async function runPagedGuest(link: string, terminal?: Terminal): Promise<
 				frame.seq !== undefined && lastSeq !== undefined && frame.epoch === lastEpoch && frame.seq > lastSeq + 1;
 			if (frame.epoch !== undefined) lastEpoch = frame.epoch;
 			if (frame.seq !== undefined) lastSeq = frame.seq;
-			if (frame.reqId === pending?.id) {
-				clearPending();
-				viewport.error = "History changed · Ctrl+End to reload";
-			}
+			if (frame.reqId === pending?.id) clearPending();
 			if (viewport.followsLive) {
 				fetch("before");
-			} else if (structuralChange || sequenceRegression || sequenceGap)
-				viewport.status = "Missed updates · Ctrl+End to return to live";
-			else viewport.status = "New activity · Ctrl+End to return to live";
+			} else if (!pending) {
+				// The host's history moved while the guest is anchored: cursor fetches
+				// carry the guest's revision, so a stale one would bounce forever.
+				// Resync under the new revision by refetching the window ending at
+				// the user's anchor — bounded to a page, never a transcript download.
+				revision = frame.revision;
+				const anchor = viewport.anchorCursor();
+				viewport.cache.clear();
+				if (anchor) fetch("before", anchor);
+				else fetch("before");
+				viewport.status =
+					structuralChange || sequenceRegression || sequenceGap
+						? "Resyncing after missed updates…"
+						: "Resyncing after new activity…";
+			}
 		} else if (frame.t === "state") {
 			viewport.status = `${frame.state.sessionName ?? "Remote session"} · ${frame.state.isStreaming ? "working" : "idle"}`;
 		} else if (frame.t === "prompt-status") {

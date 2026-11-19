@@ -154,3 +154,76 @@ it("renders bounded recent history, submits online, and retains cached text and 
 	});
 	expect(screen()).toContain("offline draft");
 });
+
+it("keeps loading earlier history after a revision change while anchored, without a full reload", async () => {
+	installInMemoryRelay();
+	const snapshot: Snapshot = {
+		header: { type: "session", id: "paged-scroll", timestamp: "2026-11-17", cwd: "/tmp" },
+		entries: [
+			{
+				type: "message",
+				id: "oldest",
+				parentId: null,
+				timestamp: "2026-11-17",
+				message: { role: "user", content: "OMEGA OLDEST MESSAGE", timestamp: 0 },
+			},
+			{
+				type: "message",
+				id: "big",
+				parentId: "oldest",
+				timestamp: "2026-11-17",
+				message: { role: "user", content: "big history ".repeat(200_000), timestamp: 0 },
+			},
+		],
+	};
+	const ctx = makeHostContext(snapshot, { notices: [], participantCounts: [] });
+	let revision = "r1";
+	ctx.sessionManager.getReplicationRevision = () => revision;
+	ctx.sessionManager.getBranch = () => [...snapshot.entries];
+	const host = new CollabHost(ctx);
+	cleanups.push(() => host.stop("test done"));
+	await host.start("ws://localhost:8788");
+	const storage = new RemoteStateStorage(path.join(getConfigRootDir(), "remote", "guests"), host.link);
+	const terminal = new VirtualTerminal(100, 24);
+	const running = runPagedGuest(host.link, terminal);
+	void running.catch(() => {});
+	cleanups.push(async () => {
+		terminal.sendInput("\x03");
+		await running;
+	});
+	const screen = (): string => terminal.getViewport().join("\n");
+	// PageUp moves 18 rows; pages are thousands of rows, so scroll in batches.
+	const scrollBatches = async (batches: number): Promise<void> => {
+		for (let i = 0; i < batches; i++) {
+			for (let j = 0; j < 50; j++) terminal.sendInput("\x1b[5~");
+			await Bun.sleep(10);
+		}
+	};
+	await waitFor(() => screen().includes("big history"), "initial page renders");
+	// Drain exactly one page fetch (the saved cache grows to two pages), so the
+	// bump lands while the guest is anchored mid-history with more above.
+	const savedPages = async (): Promise<number> => (await storage.load())?.pages.length ?? 0;
+	await scrollBatches(12);
+	const savedDeadline = Date.now() + 5_000;
+	while ((await savedPages()) < 2 && Date.now() < savedDeadline) await Bun.sleep(10);
+	if ((await savedPages()) < 2) throw new Error("first scroll-up page fetched");
+	// The host's history moves while the guest stays anchored: previously every
+	// later cursor fetch carried the stale revision and bounced forever.
+	revision = "r2";
+	ctx.sessionManager.onEntryAppended?.({
+		type: "message",
+		id: "appended",
+		parentId: "big",
+		timestamp: "2026-11-17",
+		message: { role: "user", content: "appended while anchored", timestamp: 0 },
+	});
+	// The resync (triggered by the history-changed notification) must recover the
+	// anchored window under the new revision; previously every later cursor fetch
+	// bounced forever and the start of the conversation was unreachable.
+	const deadline = Date.now() + 20_000;
+	while (!screen().includes("Start of conversation") && Date.now() < deadline) {
+		await scrollBatches(4);
+	}
+	expect(screen()).toContain("Start of conversation");
+	expect(screen()).not.toContain("Missed updates");
+});
